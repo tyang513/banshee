@@ -1,5 +1,5 @@
 # banshee
-A promtheus push gateway
+A prometheus push gateway
 
 1.需要给接口 post 如下侧格式的信息 所有 post 的值 需要写在 body 内传输 不要写表单
 ```
