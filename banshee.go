@@ -12,31 +12,129 @@ import (
 	"github.com/70data/golang-prometheus/prometheus/promhttp"
 )
 
-// {"type":"kv", "app":"sre","metric":"gatewaytest","value":"12345", "timeout":"60", "method":"GET", "protocol":"HTTP"}
-// {"type":"kv", "app":"sre","metric":"gatewaytest","value":"12345", "timeout":"", "method":"POST", "protocol":"HTTP"}
+// {"type":"kv", "app":"center","metric":"test","value":"12345", "timeout":"60", "method":"GET", "protocol":"HTTP"}
+// {"type":"kv", "app":"center","metric":"test","value":"123456", "timeout":"", "method":"POST", "protocol":"HTTPS"}
+
+var ReqQueue chan string
 
 var (
-	LabelStore        map[string]int64
-	ValueStore        map[string]interface{}
-	TimeOutLabelStore map[string]string
-	TimeOutLineStore  map[string]int64
+	LabelStore map[string]int64
+	lsSync     sync.Mutex
 )
+
+var (
+	ValueStore map[string]interface{}
+	vsSync     sync.Mutex
+)
+
+var (
+	TimeOutLabelStore map[string]string
+	toLabelSync       sync.Mutex
+)
+
+var (
+	TimeOutLineStore map[string]int64
+	toLineSync       sync.Mutex
+)
+
+func mapSort(naiveMap map[string]string) []string {
+	sortedKeys := make([]string, 0)
+	for indexK, _ := range naiveMap {
+		if indexK != "type" && indexK != "metric" && indexK != "value" && indexK != "timeout" {
+			sortedKeys = append(sortedKeys, indexK)
+		}
+	}
+	sort.Strings(sortedKeys)
+	return sortedKeys
+}
+
+func timeOutMark(cur int64, timeOutMap map[string]string) {
+	timeOut := timeOutMap["timeout"]
+	if timeOut != "" {
+		delete(timeOutMap, "value")
+		resaultJSON, err := json.Marshal(timeOutMap)
+		if err != nil {
+			fmt.Println(err)
+		}
+		resaultBase := base64.StdEncoding.EncodeToString(resaultJSON)
+		toLabelSync.Lock()
+		TimeOutLabelStore[resaultBase] = timeOut
+		toLabelSync.Unlock()
+		toLineSync.Lock()
+		TimeOutLineStore[resaultBase] = cur
+		toLineSync.Unlock()
+	}
+}
+
+// init prometheus struct
+func dataInit(dataInitMap map[string]string) {
+	var customLabels []string
+	var valueArray []string
+	metric := dataInitMap["metric"]
+	value := dataInitMap["value"]
+	n, _ := strconv.ParseFloat(value, 64)
+	initKeyArray := mapSort(dataInitMap)
+	for _, v := range initKeyArray {
+		customLabels = append(customLabels, v)
+		valueArray = append(valueArray, dataInitMap[v])
+	}
+	vsSync.Lock()
+	ValueStore[metric] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: metric,
+		Help: "custom info.",
+	}, customLabels)
+	prometheus.MustRegister(ValueStore[metric].(*prometheus.GaugeVec))
+	ValueStore[metric].(*prometheus.GaugeVec).WithLabelValues(valueArray...).Set(n)
+	vsSync.Unlock()
+	fmt.Println(dataInitMap)
+}
+
+// add value to prometheus
+func dataConvert(dataMap map[string]string) {
+	var valueArray []string
+	metric := dataMap["metric"]
+	value := dataMap["value"]
+	n, _ := strconv.ParseFloat(value, 64)
+	convertKeyArray := mapSort(dataMap)
+	for _, v := range convertKeyArray {
+		valueArray = append(valueArray, dataMap[v])
+	}
+	vsSync.Lock()
+	ValueStore[metric].(*prometheus.GaugeVec).WithLabelValues(valueArray...).Set(n)
+	vsSync.Unlock()
+}
 
 func Init() {
 	LabelStore = make(map[string]int64)
 	ValueStore = make(map[string]interface{})
 	TimeOutLabelStore = make(map[string]string)
 	TimeOutLineStore = make(map[string]int64)
+	ReqQueue = make(chan string, 100000)
 }
 
-func timeOutMark(cur int64, resaultMap map[string]string) {
-	timeout := resaultMap["timeout"]
-	if timeout != "" {
-		delete(resaultMap, "value")
-		resaultJSON, _ := json.Marshal(resaultMap)
-		resaultBase := base64.StdEncoding.EncodeToString(resaultJSON)
-		TimeOutLabelStore[resaultBase] = timeout
-		TimeOutLineStore[resaultBase] = cur
+func Process() {
+	numCPU := runtime.NumCPU()
+	for i := 1; i <= numCPU; i++ {
+		go func() {
+			for {
+				bodyStr := <-ReqQueue
+				var resaultMap map[string]string
+				json.Unmarshal([]byte(bodyStr), &resaultMap)
+				metric := resaultMap["metric"]
+				cur := time.Now().Unix()
+				lsSync.Lock()
+				if _, ok := LabelStore[metric]; ok {
+					LabelStore[metric] = cur
+					dataConvert(resaultMap)
+					timeOutMark(cur, resaultMap)
+				} else {
+					LabelStore[metric] = cur
+					dataInit(resaultMap)
+					timeOutMark(cur, resaultMap)
+				}
+				lsSync.Unlock()
+			}
+		}()
 	}
 }
 
@@ -45,6 +143,8 @@ func timeOutMarkDelete() {
 	for {
 		<-monitorTimeOut.C
 		nowTime := time.Now().Unix()
+		toLabelSync.Lock()
+		toLineSync.Lock()
 		for resaultBase, timeLineStr := range TimeOutLabelStore {
 			resaultBytes, _ := base64.StdEncoding.DecodeString(resaultBase)
 			timeLine, _ := strconv.ParseInt(timeLineStr, 10, 64)
@@ -55,95 +155,40 @@ func timeOutMarkDelete() {
 				var valueArray []string
 				json.Unmarshal(resaultBytes, &metricInfoTemp)
 				metric := metricInfoTemp["metric"]
-				sortedKeys := make([]string, 0)
-				for indexK, _ := range metricInfoTemp {
-					if indexK != "type" && indexK != "metric" && indexK != "timeout" {
-						sortedKeys = append(sortedKeys, indexK)
+				deleteKeys := make([]string, 0)
+				for k, _ := range metricInfoTemp {
+					if k != "type" && k != "metric" && k != "timeout" {
+						deleteKeys = append(deleteKeys, k)
 					}
 				}
-				for _, v := range sortedKeys {
+				for _, v := range deleteKeys {
 					valueArray = append(valueArray, metricInfoTemp[v])
 				}
-				sort.Strings(sortedKeys)
-				fmt.Println(sortedKeys, valueArray)
+				sort.Strings(deleteKeys)
+				vsSync.Lock()
 				ValueStore[metric].(*prometheus.GaugeVec).DeleteLabelValues(valueArray...)
+				vsSync.Unlock()
 				delete(TimeOutLabelStore, resaultBase)
 				delete(TimeOutLineStore, resaultBase)
+				fmt.Println(metricInfoTemp)
 			}
 		}
+		toLabelSync.Unlock()
+		toLineSync.Unlock()
 	}
-}
-
-// init prometheus struct
-func dataInit(resaultMap map[string]string) {
-	var customLabels []string
-	var valueArray []string
-	metric := resaultMap["metric"]
-	value := resaultMap["value"]
-	n, _ := strconv.ParseFloat(value, 64)
-	sortedKeys := make([]string, 0)
-	for indexK, _ := range resaultMap {
-		if indexK != "type" && indexK != "metric" && indexK != "value" && indexK != "timeout" {
-			sortedKeys = append(sortedKeys, indexK)
-		}
-	}
-	sort.Strings(sortedKeys)
-	for _, v := range sortedKeys {
-		customLabels = append(customLabels, v)
-		valueArray = append(valueArray, resaultMap[v])
-	}
-	ValueStore[metric] = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: metric,
-		Help: "custom info.",
-	}, customLabels)
-	prometheus.MustRegister(ValueStore[metric].(*prometheus.GaugeVec))
-	ValueStore[metric].(*prometheus.GaugeVec).WithLabelValues(valueArray...).Set(n)
-}
-
-// add value to prometheus
-func dataConvert(resaultMap map[string]string) {
-	var valueArray []string
-	metric := resaultMap["metric"]
-	value := resaultMap["value"]
-	n, _ := strconv.ParseFloat(value, 64)
-	sorted_keys := make([]string, 0)
-	for indexK, _ := range resaultMap {
-		if indexK != "type" && indexK != "metric" && indexK != "value" && indexK != "timeout" {
-			sorted_keys = append(sorted_keys, indexK)
-		}
-	}
-	sort.Strings(sorted_keys)
-	for _, v := range sorted_keys {
-		valueArray = append(valueArray, resaultMap[v])
-	}
-	ValueStore[metric].(*prometheus.GaugeVec).WithLabelValues(valueArray...).Set(n)
 }
 
 // Receive custom data.
 func customData(res http.ResponseWriter, req *http.Request) {
-	len := req.ContentLength
-	body := make([]byte, len)
-	defer req.Body.Close()
-	req.Body.Read(body)
-	var resaultMap map[string]string
-	json.Unmarshal([]byte(string(body)), &resaultMap)
-	metric := resaultMap["metric"]
-	cur := time.Now().Unix()
-	if _, ok := LabelStore[metric]; ok {
-		LabelStore[metric] = cur
-		go dataConvert(resaultMap)
-		go timeOutMark(cur, resaultMap)
-	} else {
-		LabelStore[metric] = cur
-		fmt.Println(LabelStore)
-		dataInit(resaultMap)
-		go timeOutMark(cur, resaultMap)
-	}
+	body, _ := ioutil.ReadAll(req.Body)
 	res.Write([]byte("succeed"))
+	ReqQueue <- string(body)
+	req.Body.Close()
 }
 
 func main() {
 	Init()
+	go Process()
 	go timeOutMarkDelete()
 	http.HandleFunc("/customData/", customData)
 	http.Handle("/metrics", promhttp.Handler())
