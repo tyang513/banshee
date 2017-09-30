@@ -13,13 +13,65 @@ import (
 )
 
 // {"type":"kv", "app":"sre","metric":"gatewaytest","value":"12345", "timeout":"60", "method":"GET", "protocol":"HTTP"}
+// {"type":"kv", "app":"sre","metric":"gatewaytest","value":"12345", "timeout":"", "method":"POST", "protocol":"HTTP"}
 
-var LabelStore map[string]int64
-var ValueStore map[string]interface{}
+var (
+	LabelStore        map[string]int64
+	ValueStore        map[string]interface{}
+	TimeOutLabelStore map[string]string
+	TimeOutLineStore  map[string]int64
+)
 
 func Init() {
 	LabelStore = make(map[string]int64)
 	ValueStore = make(map[string]interface{})
+	TimeOutLabelStore = make(map[string]string)
+	TimeOutLineStore = make(map[string]int64)
+}
+
+func timeOutMark(cur int64, resaultMap map[string]string) {
+	timeout := resaultMap["timeout"]
+	if timeout != "" {
+		delete(resaultMap, "value")
+		resaultJSON, _ := json.Marshal(resaultMap)
+		resaultBase := base64.StdEncoding.EncodeToString(resaultJSON)
+		TimeOutLabelStore[resaultBase] = timeout
+		TimeOutLineStore[resaultBase] = cur
+	}
+}
+
+func timeOutMarkDelete() {
+	monitorTimeOut := time.NewTicker(60 * time.Second)
+	for {
+		<-monitorTimeOut.C
+		nowTime := time.Now().Unix()
+		for resaultBase, timeLineStr := range TimeOutLabelStore {
+			resaultBytes, _ := base64.StdEncoding.DecodeString(resaultBase)
+			timeLine, _ := strconv.ParseInt(timeLineStr, 10, 64)
+			lastMarkTime := TimeOutLineStore[resaultBase]
+			// delete time out data
+			if timeLine < (nowTime - lastMarkTime) {
+				var metricInfoTemp map[string]string
+				var valueArray []string
+				json.Unmarshal(resaultBytes, &metricInfoTemp)
+				metric := metricInfoTemp["metric"]
+				sortedKeys := make([]string, 0)
+				for indexK, _ := range metricInfoTemp {
+					if indexK != "type" && indexK != "metric" && indexK != "timeout" {
+						sortedKeys = append(sortedKeys, indexK)
+					}
+				}
+				for _, v := range sortedKeys {
+					valueArray = append(valueArray, metricInfoTemp[v])
+				}
+				sort.Strings(sortedKeys)
+				fmt.Println(sortedKeys, valueArray)
+				ValueStore[metric].(*prometheus.GaugeVec).DeleteLabelValues(valueArray...)
+				delete(TimeOutLabelStore, resaultBase)
+				delete(TimeOutLineStore, resaultBase)
+			}
+		}
+	}
 }
 
 // init prometheus struct
@@ -29,14 +81,14 @@ func dataInit(resaultMap map[string]string) {
 	metric := resaultMap["metric"]
 	value := resaultMap["value"]
 	n, _ := strconv.ParseFloat(value, 64)
-	sorted_keys := make([]string, 0)
+	sortedKeys := make([]string, 0)
 	for indexK, _ := range resaultMap {
 		if indexK != "type" && indexK != "metric" && indexK != "value" && indexK != "timeout" {
-			sorted_keys = append(sorted_keys, indexK)
+			sortedKeys = append(sortedKeys, indexK)
 		}
 	}
-	sort.Strings(sorted_keys)
-	for _, v := range sorted_keys {
+	sort.Strings(sortedKeys)
+	for _, v := range sortedKeys {
 		customLabels = append(customLabels, v)
 		valueArray = append(valueArray, resaultMap[v])
 	}
@@ -45,7 +97,6 @@ func dataInit(resaultMap map[string]string) {
 		Help: "custom info.",
 	}, customLabels)
 	prometheus.MustRegister(ValueStore[metric].(*prometheus.GaugeVec))
-	fmt.Println(valueArray)
 	ValueStore[metric].(*prometheus.GaugeVec).WithLabelValues(valueArray...).Set(n)
 }
 
@@ -65,7 +116,6 @@ func dataConvert(resaultMap map[string]string) {
 	for _, v := range sorted_keys {
 		valueArray = append(valueArray, resaultMap[v])
 	}
-	fmt.Println(valueArray)
 	ValueStore[metric].(*prometheus.GaugeVec).WithLabelValues(valueArray...).Set(n)
 }
 
@@ -78,20 +128,23 @@ func customData(res http.ResponseWriter, req *http.Request) {
 	var resaultMap map[string]string
 	json.Unmarshal([]byte(string(body)), &resaultMap)
 	metric := resaultMap["metric"]
+	cur := time.Now().Unix()
 	if _, ok := LabelStore[metric]; ok {
+		LabelStore[metric] = cur
 		go dataConvert(resaultMap)
-
+		go timeOutMark(cur, resaultMap)
 	} else {
-		cur := time.Now().Unix()
 		LabelStore[metric] = cur
 		fmt.Println(LabelStore)
 		dataInit(resaultMap)
+		go timeOutMark(cur, resaultMap)
 	}
 	res.Write([]byte("succeed"))
 }
 
 func main() {
 	Init()
+	go timeOutMarkDelete()
 	http.HandleFunc("/customData/", customData)
 	http.Handle("/metrics", promhttp.Handler())
 	http.ListenAndServe(":2336", nil)
